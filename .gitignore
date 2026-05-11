@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/agent3000.db
+data/.agent_cache.json
+.streamlit/
+.dockerignore
+ui-ux-pro-max-skill/
+.opencode/skills/ui-ux-pro-max/
+*.egg-info/
+dist/
+build/

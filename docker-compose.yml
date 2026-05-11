@@ -1,0 +1,10 @@
+services:
+  agent3000:
+    build: .
+    container_name: agent3000
+    ports:
+      - "8502:8501"
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env
+    restart: unless-stopped

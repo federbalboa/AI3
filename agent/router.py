@@ -215,12 +215,10 @@ def _execute_query_impl(messages: list, llm_type_override=None, ollama_model_ove
             chat_history.append(HumanMessage(content=msg["content"]))
         else:
             chat_history.append(AIMessage(content=msg["content"]))
-            
-    agent = create_react_agent(llm, tools=agent_tools, prompt=system_prompt)
-    
+
     if progress_callback:
         progress_callback("🤖 Generando respuesta final (Esto puede tardar unos segundos)...")
-        
+
     try:
         response = agent.invoke({
             "messages": chat_history

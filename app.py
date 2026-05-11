@@ -5,11 +5,13 @@ import pandas as pd
 from dotenv import load_dotenv, set_key
 from agent.router import execute_query
 from database import get_conn, read_table, write_table, ensure_table, list_tables, table_exists, find_or_create_table, migrate_all_csvs
+from auth import verify_user, register_user, get_all_users, toggle_user, delete_user, update_user_role, ROLES, init_auth
 
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 load_dotenv(dotenv_path=env_path, override=True)
 
 migrate_all_csvs()
+init_auth()
 
 st.set_page_config(page_title="Agent 3000", page_icon="🤖", layout="wide")
 
@@ -272,14 +274,165 @@ hr { border-color: rgba(99,102,241,0.05) !important; margin: 8px 0 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Init state ─────────────────────────────────────────────────────────
-PROFILE_TABLE = find_or_create_table("user_profile", "Chat General", "Nombre,Rol,Departamento,Estado")
-df_profile = read_table(PROFILE_TABLE)
-if df_profile.empty:
-    df_profile = pd.DataFrame([{"Nombre": "Usuario Admin", "Rol": "Director General", "Departamento": "Gerencia", "Estado": "Activo"}])
-    write_table(PROFILE_TABLE, df_profile)
+# ── Auth / Login Screen ─────────────────────────────────────────────
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+if "current_user" not in st.session_state:
+    st.session_state["current_user"] = None
 
-user_data = df_profile.iloc[0].to_dict() if not df_profile.empty else {"Nombre": "Desconocido", "Rol": "Usuario", "Departamento": ""}
+if not st.session_state.get("logged_in"):
+    st.markdown("""
+        <style>
+        body { background: #080c18; }
+        .login-wrap {
+            display: flex; flex-direction: column; align-items: center;
+            justify-content: center; min-height: 80vh; padding: 2rem;
+        }
+        .login-card {
+            background: rgba(15, 20, 40, 0.9);
+            border: 1px solid rgba(99,102,241,0.15);
+            border-radius: 16px; padding: 2.5rem; width: 100%; max-width: 400px;
+            backdrop-filter: blur(20px);
+        }
+        .login-title {
+            font-size: 1.6rem; font-weight: 700; text-align: center; margin-bottom: 1.5rem;
+            background: linear-gradient(135deg, #a5b4fc, #6366f1);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    tab_login, tab_register = st.tabs(["Iniciar Sesión", "Registrarse"])
+
+    with tab_login:
+        st.markdown("<div class='login-title'>Agent 3000</div>", unsafe_allow_html=True)
+        login_user = st.text_input("Usuario", placeholder="Tu usuario...", key="login_user")
+        login_pass = st.text_input("Contraseña", type="password", placeholder="Tu contraseña...", key="login_pass")
+        if st.button("Entrar", use_container_width=True):
+            if login_user and login_pass:
+                ok, user_info = verify_user(login_user, login_pass)
+                if ok:
+                    st.session_state["logged_in"] = True
+                    st.session_state["current_user"] = user_info
+                    st.rerun()
+                else:
+                    st.error("Usuario o contraseña incorrectos.")
+            else:
+                st.warning("Completa ambos campos.")
+        else:
+            st.markdown("<div style='text-align:center; margin-top:1rem; color:#4a5578; font-size:0.8rem'>Crea una cuenta para comenzar</div>", unsafe_allow_html=True)
+
+    with tab_register:
+        st.markdown("<div class='login-title'>Crear Cuenta</div>", unsafe_allow_html=True)
+        reg_user = st.text_input("Usuario", placeholder="Nombre de usuario...", key="reg_user")
+        reg_pass = st.text_input("Contraseña", type="password", placeholder="Mínimo 6 caracteres", key="reg_pass")
+        reg_nombre = st.text_input("Nombre completo", placeholder="Tu nombre...", key="reg_nombre")
+        reg_email = st.text_input("Email", placeholder="email@ejemplo.com", key="reg_email")
+        reg_role = st.selectbox("Rol", ROLES, index=4, label_visibility="collapsed", key="reg_role")
+        if st.button("Crear Cuenta", use_container_width=True):
+            if reg_user and reg_pass and reg_nombre:
+                ok, msg = register_user(reg_user, reg_pass, reg_role, reg_nombre, reg_email)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+            else:
+                st.warning("Usuario, contraseña y nombre son requeridos.")
+    st.stop()
+
+# ── Logged in user setup ────────────────────────────────────────────
+user_data = st.session_state["current_user"]
+
+# ── Health check popup on login ──────────────────────────────────────
+def health_check():
+    issues = []
+    llm_status = "UNKNOWN"
+    db_status = "UNKNOWN"
+
+    # Check DB
+    try:
+        conn = get_conn()
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+        db_status = "OK"
+    except Exception as e:
+        db_status = f"ERROR: {e}"
+        issues.append(f"Database: {e}")
+
+    # Check LLM
+    try:
+        from agent.llm_setup import get_llm
+        llm = get_llm()
+        llm_type = os.getenv("LLM_TYPE", "ollama")
+        if llm_type == "ollama":
+            model_name = os.getenv("OLLAMA_MODEL", "llama3.2")
+            response = llm.invoke("ping")
+            llm_status = "OK"
+        elif llm_type == "gemini":
+            response = llm.invoke("ping")
+            llm_status = "OK"
+        else:
+            llm_status = "OK"
+    except Exception as e:
+        llm_status = f"ERROR"
+        issues.append(f"LLM ({llm_type}): {str(e)[:100]}")
+
+    return db_status, llm_status, issues
+
+if "_health_shown" not in st.session_state:
+    st.session_state["_health_shown"] = False
+
+if not st.session_state.get("_health_shown"):
+    db_status, llm_status, issues = health_check()
+    st.session_state["_health_shown"] = True
+
+    db_color = "#22c55e" if db_status == "OK" else "#f43f5e"
+    llm_color = "#22c55e" if llm_status == "OK" else "#f43f5e"
+    db_icon = "check_circle" if db_status == "OK" else "error"
+    llm_icon = "check_circle" if llm_status == "OK" else "error"
+
+    st.markdown(f"""
+    <style>
+    .health-popup {{
+        position: fixed; top: 10px; right: 10px; z-index: 9999;
+        background: rgba(15,20,40,0.98); border: 1px solid rgba(99,102,241,0.3);
+        border-radius: 12px; padding: 16px 20px; min-width: 260px;
+        backdrop-filter: blur(20px); box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    }}
+    .health-title {{ font-weight: 700; font-size: 0.9rem; color: #a5b4fc; margin-bottom: 10px; }}
+    .health-row {{ display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 0.8rem; }}
+    .health-ok {{ color: #22c55e; }}
+    .health-err {{ color: #f43f5e; }}
+    </style>
+    <div class="health-popup" id="healthBox">
+        <div class="health-title">Diagnostico del Sistema</div>
+        <div class="health-row">
+            <span class="material-icons" style="font-size:16px; color:{db_color}">{db_icon}</span>
+            <span style="color:#94a3b8; width:60px">Base DB</span>
+            <span class="{'health-ok' if db_status=='OK' else 'health-err'}">{db_status}</span>
+        </div>
+        <div class="health-row">
+            <span class="material-icons" style="font-size:16px; color:{llm_color}">{llm_icon}</span>
+            <span style="color:#94a3b8; width:60px">LLM</span>
+            <span class="{'health-ok' if llm_status=='OK' else 'health-err'}">{llm_status}</span>
+        </div>
+        {"<div style='margin-top:8px; font-size:0.75rem; color:#f43f5e'>" + "<br>".join(issues) + "</div>" if issues else ""}
+    </div>
+    <script>
+    setTimeout(function(){{ var el=document.getElementById('healthBox'); if(el) el.style.display='none'; }}, 6000);
+    </script>
+    """, unsafe_allow_html=True)
+
+    st.button("Cerrar diagnostico", key="close_health")
+
+PROFILE_TABLE = find_or_create_table("user_profile", "Chat General", "Nombre,Rol,Departamento,Estado")
+
+role_icons = {"admin": "admin_panel_settings", "desarrollador": "code", "analista": "analytics", "financiero": "account_balance", "general": "person"}
+role_colors = {"admin": "#f43f5e", "desarrollador": "#06b6d4", "analista": "#a855f7", "financiero": "#22c55e", "general": "#6366f1"}
+role_labels_es = {"admin": "Administrador", "desarrollador": "Desarrollador", "analista": "Analista", "financiero": "Financiero", "general": "General"}
+icon = role_icons.get(user_data["role"], "person")
+color = role_colors.get(user_data["role"], "#6366f1")
+role_es = role_labels_es.get(user_data["role"], user_data["role"])
 
 clients_path = os.path.join("data", "clientes")
 if os.path.exists(clients_path):
@@ -293,25 +446,23 @@ if "_selected_workspace" not in st.session_state:
 # ── Sidebar ─────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(
-        "<div class='sb-brand'>"
-        "<div class='sb-brand-icon'>"
-        "<svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>"
-        "<circle cx='12' cy='12' r='3'/><path d='M12 1v4m0 14v4M1 12h4m14 0h4'/>"
-        "</svg>"
-        "</div>"
-        "<div><div class='sb-brand-text'>Agent 3000</div><div class='sb-brand-sub'>Enterprise AI</div></div>"
-        "</div>",
+        f"<div class='sb-brand'>"
+        f"<div class='sb-brand-icon' style='background:{color}22; border:1px solid {color}66'>"
+        f"<span class='material-icons' style='font-size:18px; color:{color}'>{icon}</span>"
+        f"</div>"
+        f"<div><div class='sb-brand-text'>{user_data['nombre']}</div>"
+        f"<div class='sb-brand-sub' style='color:{color}'>{role_es}</div></div>"
+        f"</div>",
         unsafe_allow_html=True
     )
 
     st.markdown("<div class='sb-label'>Workspace</div>", unsafe_allow_html=True)
     ws_options = ["Chat General"] + client_folders
+    ws_default = st.session_state["_selected_workspace"] if st.session_state["_selected_workspace"] in ws_options else ws_options[0]
     selected_chat = st.radio(
-        "",
+        "Seleccionar workspace",
         ws_options,
-        index=ws_options.index(st.session_state["_selected_workspace"])
-        if st.session_state["_selected_workspace"] in ws_options
-        else 0,
+        index=ws_options.index(ws_default) if ws_default in ws_options else 0,
         label_visibility="collapsed",
         key="workspace_radio"
     )
@@ -332,13 +483,14 @@ with st.sidebar:
 
     st.markdown("<hr>", unsafe_allow_html=True)
     st.markdown("<div class='sb-label'>Herramientas</div>", unsafe_allow_html=True)
-    if st.button("Ver Base de Datos", use_container_width=True):
-        st.session_state["current_view"] = "database_browser"
-        st.rerun()
-    if st.session_state.get("current_view") == "database_browser":
-        if st.button("Volver al Chat", use_container_width=True):
-            st.session_state["current_view"] = "chat"
+    if user_data["role"] in ["admin", "desarrollador", "analista", "financiero"]:
+        if st.button("Ver Base de Datos", use_container_width=True):
+            st.session_state["current_view"] = "database_browser"
             st.rerun()
+        if st.session_state.get("current_view") == "database_browser":
+            if st.button("Volver al Chat", use_container_width=True):
+                st.session_state["current_view"] = "chat"
+                st.rerun()
 
     if st.session_state.get("show_add_client"):
         with st.container(border=True):
@@ -409,7 +561,15 @@ with st.sidebar:
                     os.environ["OLLAMA_MODEL"] = ollama_model
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown(f"<div class='sb-footer'>v2.0 &middot; {len(client_folders)} workspaces</div>", unsafe_allow_html=True)
+    if st.button("Cerrar Sesión", use_container_width=True):
+        st.session_state["logged_in"] = False
+        st.session_state["current_user"] = None
+        st.rerun()
+    if user_data["role"] == "admin":
+        if st.button("Admin", use_container_width=True):
+            st.session_state["current_view"] = "admin"
+            st.rerun()
+    st.markdown(f"<div class='sb-footer'>Agent 3000 &middot; {len(client_folders)} workspaces</div>", unsafe_allow_html=True)
 
 # ── Top Header ──────────────────────────────────────────────────────────
 st.markdown(
@@ -427,9 +587,9 @@ st.markdown(
     f"</div>"
     f"<div class='top-hdr-right'>"
     f"<div class='profile-chip'>"
-    f"<div class='profile-avatar'>{''.join([w[0] for w in user_data.get('Nombre', 'U').split()[:2]]).upper()}</div>"
-    f"<div><div class='profile-name'>{user_data.get('Nombre', 'Usuario')}</div>"
-    f"<div class='profile-role'>{user_data.get('Rol', '')}</div></div>"
+    f"<div class='profile-avatar' style='background:{color}33; color:{color}'>{''.join([w[0] for w in user_data.get('nombre', 'U').split()[:2]]).upper()}</div>"
+    f"<div><div class='profile-name'>{user_data.get('nombre', 'Usuario')}</div>"
+    f"<div class='profile-role' style='color:{color}'>{role_es}</div></div>"
     f"</div>"
     f"</div>"
     f"</div>",
@@ -689,3 +849,78 @@ if st.session_state.get("pending_visual_edit"):
         if st.button("Cerrar Editor"):
             st.session_state["pending_visual_edit"] = None
             st.rerun()
+
+# ── Admin Panel ──────────────────────────────────────────────────────
+if st.session_state.get("current_view") == "admin" and user_data["role"] == "admin":
+    st.markdown("## Panel de Administración")
+    st.markdown("---")
+
+    tab_users, tab_create = st.tabs(["Usuarios", "Crear Usuario"])
+
+    with tab_users:
+        users = get_all_users()
+        if not users:
+            st.info("No hay usuarios registrados.")
+        else:
+            cols = st.columns([1, 2, 2, 2, 1, 1, 1])
+            headers = ["ID", "Usuario", "Nombre", "Email", "Rol", "Activo", "Acciones"]
+            for h in headers:
+                st.markdown(f"<div style='font-weight:600; font-size:0.8rem; color:#818cf8; padding:4px 8px'>{h}</div>", unsafe_allow_html=True)
+            for u in users:
+                c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 2, 2, 2, 1, 1, 1])
+                with c1:
+                    st.text(u["id"][:12] + "...")
+                with c2:
+                    st.markdown(f"**{u['username']}**")
+                with c3:
+                    st.text(u["nombre"] or "-")
+                with c4:
+                    st.text(u["email"] or "-")
+                with c5:
+                    st.selectbox(
+                        "Rol", ROLES,
+                        index=ROLES.index(u["role"]) if u["role"] in ROLES else 4,
+                        key=f"role_{u['id']}",
+                        label_visibility="collapsed"
+                    )
+                with c6:
+                    toggled = st.checkbox("Activo", value=u["activo"], key=f"act_{u['id']}", label_visibility="collapsed")
+                with c7:
+                    cbtn, dbtn = st.columns(2)
+                    with cbtn:
+                        if st.button("💾", key=f"saverole_{u['id']}"):
+                            new_r = st.session_state[f"role_{u['id']}"]
+                            update_user_role(u["id"], new_r)
+                            toggle_user(u["id"], st.session_state[f"act_{u['id']}"])
+                            st.success(f"Usuario '{u['username']}' actualizado.")
+                            st.rerun()
+                    with dbtn:
+                        if st.button("🗑️", key=f"del_{u['id']}"):
+                            if u["username"] != user_data["username"]:
+                                delete_user(u["id"])
+                                st.success(f"Usuario '{u['username']}' eliminado.")
+                                st.rerun()
+                            else:
+                                st.warning("No puedes eliminarte a ti mismo.")
+
+    with tab_create:
+        st.markdown("### Crear Nuevo Usuario")
+        cu_user = st.text_input("Usuario", key="cu_user")
+        cu_pass = st.text_input("Contraseña", type="password", key="cu_pass")
+        cu_nombre = st.text_input("Nombre completo", key="cu_nombre")
+        cu_email = st.text_input("Email", key="cu_email")
+        cu_role = st.selectbox("Rol", ROLES, key="cu_role")
+        if st.button("Crear Usuario", use_container_width=True):
+            if cu_user and cu_pass and cu_nombre:
+                ok, msg = register_user(cu_user, cu_pass, cu_role, cu_nombre, cu_email)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+            else:
+                st.warning("Usuario, contraseña y nombre son requeridos.")
+
+    if st.button("← Volver al Chat"):
+        st.session_state["current_view"] = "chat"
+        st.rerun()
